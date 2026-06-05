@@ -11,6 +11,9 @@ players = {}
 # { socket_id: partner_socket_id }
 matches = {}
 
+# { socket_id: True } — tracks who is the host of their match
+hosts = {}
+
 
 def broadcast_players():
     """Send each client the full player list with availability status."""
@@ -69,10 +72,13 @@ def on_invite_accept(data):
     matches[sender_sid]   = accepter_sid
     matches[accepter_sid] = sender_sid
 
-    socketio.emit("matched", {"opponent": accepter_username}, to=sender_sid)
-    socketio.emit("matched", {"opponent": sender_username},   to=accepter_sid)
+    # Sender is the host
+    hosts[sender_sid] = True
 
-    print(f"[match] {sender_username} <-> {accepter_username}")
+    socketio.emit("matched", {"opponent": accepter_username, "is_host": True},  to=sender_sid)
+    socketio.emit("matched", {"opponent": sender_username,   "is_host": False}, to=accepter_sid)
+
+    print(f"[match] {sender_username} (host) <-> {accepter_username}")
     broadcast_players()
 
 
@@ -89,13 +95,45 @@ def on_invite_decline(data):
         socketio.emit("invite_declined", {"by": decliner_username}, to=sender_sid)
 
 
+@socketio.on("kick")
+def on_kick(data):
+    """Host kicks their matched partner."""
+    kicker_sid      = request.sid
+    kicker_username = players.get(kicker_sid, "")
+
+    # Only hosts can kick
+    if kicker_sid not in hosts:
+        return
+
+    partner_sid = matches.get(kicker_sid)
+    if not partner_sid:
+        return
+
+    partner_username = players.get(partner_sid, "unknown")
+
+    # Remove match
+    matches.pop(kicker_sid,   None)
+    matches.pop(partner_sid,  None)
+    hosts.pop(kicker_sid,     None)
+
+    # Notify kicked player
+    socketio.emit("kicked", {"by": kicker_username}, to=partner_sid)
+    # Notify host that kick succeeded
+    socketio.emit("kick_success", {"player": partner_username}, to=kicker_sid)
+
+    print(f"[kick] {kicker_username} kicked {partner_username}")
+    broadcast_players()
+
+
 @socketio.on("disconnect")
 def on_disconnect():
     username    = players.pop(request.sid, "unknown")
     partner_sid = matches.pop(request.sid, None)
+    hosts.pop(request.sid, None)
 
     if partner_sid:
         matches.pop(partner_sid, None)
+        hosts.pop(partner_sid,   None)
         socketio.emit("opponent_left", {}, to=partner_sid)
 
     print(f"[-] {username} left (sid={request.sid})")
