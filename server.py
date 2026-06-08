@@ -2,7 +2,7 @@ import os
 from flask import Flask, request
 from flask_socketio import SocketIO, emit
 
-app      = Flask(__name__)
+app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
 # { socket_id: username }
@@ -57,8 +57,8 @@ def on_invite(data):
 
 @socketio.on("invite_accept")
 def on_invite_accept(data):
-    sender_username   = str(data.get("from", "")).strip()
-    accepter_sid      = request.sid
+    sender_username = str(data.get("from", "")).strip()
+    accepter_sid = request.sid
     accepter_username = players.get(accepter_sid, "")
 
     sender_sid = next(
@@ -69,7 +69,7 @@ def on_invite_accept(data):
     if not sender_sid:
         return
 
-    matches[sender_sid]   = accepter_sid
+    matches[sender_sid] = accepter_sid
     matches[accepter_sid] = sender_sid
 
     # Sender is the host
@@ -84,7 +84,7 @@ def on_invite_accept(data):
 
 @socketio.on("invite_decline")
 def on_invite_decline(data):
-    sender_username   = str(data.get("from", "")).strip()
+    sender_username = str(data.get("from", "")).strip()
     decliner_username = players.get(request.sid, "")
 
     sender_sid = next(
@@ -98,7 +98,7 @@ def on_invite_decline(data):
 @socketio.on("kick")
 def on_kick(data):
     """Host kicks their matched partner."""
-    kicker_sid      = request.sid
+    kicker_sid = request.sid
     kicker_username = players.get(kicker_sid, "")
 
     # Only hosts can kick
@@ -125,9 +125,75 @@ def on_kick(data):
     broadcast_players()
 
 
+@socketio.on("game_start")
+def on_game_start(data):
+    """Host signals that the game is starting — relay to partner."""
+    starter_sid = request.sid
+
+    # Only hosts can start
+    if starter_sid not in hosts:
+        return
+
+    partner_sid = matches.get(starter_sid)
+    if not partner_sid:
+        return
+
+    starter_username = players.get(starter_sid, "")
+    print(f"[start] {starter_username} started the game")
+    socketio.emit("game_started", {}, to=partner_sid)
+
+
+@socketio.on("first_turn")
+def on_first_turn(data):
+    """Host tells both players who goes first."""
+    if request.sid not in hosts:
+        return
+    partner_sid = matches.get(request.sid)
+    if not partner_sid:
+        return
+    host_goes_first = bool(data.get("host_goes_first", True))
+    # tell partner the opposite
+    socketio.emit("first_turn", {"your_turn": not host_goes_first}, to=partner_sid)
+
+
+@socketio.on("question")
+def on_question(data):
+    """Relay a question from the asker to the answerer."""
+    partner_sid = matches.get(request.sid)
+    if partner_sid:
+        socketio.emit("question", {"text": data.get("text", "")}, to=partner_sid)
+
+
+@socketio.on("answer")
+def on_answer(data):
+    """Relay YES/NO answer back to the asker."""
+    partner_sid = matches.get(request.sid)
+    if partner_sid:
+        socketio.emit("answer", {"yes": bool(data.get("yes", False))}, to=partner_sid)
+
+
+@socketio.on("end_turn")
+def on_end_turn(data):
+    """Player signals they finished their turn — notify partner it's their turn."""
+    partner_sid = matches.get(request.sid)
+    if partner_sid:
+        socketio.emit("your_turn", {}, to=partner_sid)
+
+
+@socketio.on("game_over")
+def on_game_over(data):
+    """Relay a game-over result to the partner."""
+    partner_sid = matches.get(request.sid)
+    if partner_sid:
+        socketio.emit("game_over", {
+            "result": data.get("result", ""),
+            "reason": data.get("reason", ""),
+        }, to=partner_sid)
+
+
 @socketio.on("disconnect")
 def on_disconnect():
-    username    = players.pop(request.sid, "unknown")
+    username = players.pop(request.sid, "unknown")
     partner_sid = matches.pop(request.sid, None)
     hosts.pop(request.sid, None)
 
