@@ -156,12 +156,23 @@ def on_first_turn(data):
     socketio.emit("first_turn", {"your_turn": not host_goes_first}, to=partner_sid)
 
 
+@socketio.on("secret")
+def on_secret(data):
+    """Relay a player's secret card name to their opponent."""
+    partner_sid = matches.get(request.sid)
+    if partner_sid:
+        socketio.emit("secret", {"name": data.get("name", "")}, to=partner_sid)
+
+
 @socketio.on("question")
 def on_question(data):
     """Relay a question from the asker to the answerer."""
     partner_sid = matches.get(request.sid)
     if partner_sid:
-        socketio.emit("question", {"text": data.get("text", "")}, to=partner_sid)
+        socketio.emit("question", {
+            "text":   data.get("text", ""),
+            "secret": data.get("secret", ""),   # opponent's secret, piggybacked
+        }, to=partner_sid)
 
 
 @socketio.on("answer")
@@ -169,7 +180,10 @@ def on_answer(data):
     """Relay YES/NO answer back to the asker."""
     partner_sid = matches.get(request.sid)
     if partner_sid:
-        socketio.emit("answer", {"yes": bool(data.get("yes", False))}, to=partner_sid)
+        socketio.emit("answer", {
+            "yes":    bool(data.get("yes", False)),
+            "secret": data.get("secret", ""),   # opponent's secret, piggybacked
+        }, to=partner_sid)
 
 
 @socketio.on("end_turn")
@@ -177,7 +191,7 @@ def on_end_turn(data):
     """Player signals they finished their turn — notify partner it's their turn."""
     partner_sid = matches.get(request.sid)
     if partner_sid:
-        socketio.emit("your_turn", {}, to=partner_sid)
+        socketio.emit("your_turn", {"secret": data.get("secret", "")}, to=partner_sid)
 
 
 @socketio.on("game_over")
@@ -188,6 +202,7 @@ def on_game_over(data):
         socketio.emit("game_over", {
             "result": data.get("result", ""),
             "reason": data.get("reason", ""),
+            "secret": data.get("secret", ""),   # sender's secret dessert name
         }, to=partner_sid)
 
 
