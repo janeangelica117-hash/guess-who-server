@@ -95,6 +95,25 @@ def on_invite_decline(data):
         socketio.emit("invite_declined", {"by": decliner_username}, to=sender_sid)
 
 
+@socketio.on("leave_match")
+def on_leave_match(data):
+    """Either player signals they are leaving the match (not disconnecting)."""
+    leaver_sid = request.sid
+    partner_sid = matches.get(leaver_sid)
+
+    # Clean up match and host records for both players
+    matches.pop(leaver_sid,  None)
+    hosts.pop(leaver_sid,    None)
+    if partner_sid:
+        matches.pop(partner_sid, None)
+        hosts.pop(partner_sid,   None)
+        # Tell the partner to return to lobby
+        socketio.emit("partner_left_match", {}, to=partner_sid)
+
+    print(f"[leave_match] {players.get(leaver_sid, '?')} left the match")
+    broadcast_players()
+
+
 @socketio.on("kick")
 def on_kick(data):
     """Host kicks their matched partner."""
