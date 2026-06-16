@@ -225,6 +225,15 @@ def on_game_over(data):
         }, to=partner_sid)
 
 
+@socketio.on("chat_emoji")
+def on_chat_emoji(data):
+    """Relay an emoji reaction to the partner (shown on both screens)."""
+    partner_sid = matches.get(request.sid)
+    emoji = str(data.get("emoji", "")).strip()
+    if partner_sid and emoji:
+        socketio.emit("chat_emoji", {"emoji": emoji}, to=partner_sid)
+
+
 @socketio.on("disconnect")
 def on_disconnect():
     username = players.pop(request.sid, "unknown")
