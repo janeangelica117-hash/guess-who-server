@@ -225,6 +225,14 @@ def on_game_over(data):
         }, to=partner_sid)
 
 
+@socketio.on("profile_data")
+def on_profile_data(data):
+    """Relay a player's profile to their matched partner."""
+    partner_sid = matches.get(request.sid)
+    if partner_sid:
+        socketio.emit("profile_data", data, to=partner_sid)
+
+
 @socketio.on("chat_emoji")
 def on_chat_emoji(data):
     """Relay an emoji reaction to the partner (shown on both screens)."""
