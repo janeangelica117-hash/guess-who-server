@@ -27,6 +27,12 @@ def broadcast_players():
         socketio.emit("update_players", others, to=sid)
 
 
+@socketio.on("ping_keepalive")
+def on_ping_keepalive(data):
+    """Client keepalive ping — just acknowledge silently."""
+    pass
+
+
 @socketio.on("join")
 def on_join(data):
     username = str(data.get("username", "")).strip()
