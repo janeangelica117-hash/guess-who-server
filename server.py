@@ -231,6 +231,15 @@ def on_game_over(data):
         }, to=partner_sid)
 
 
+@socketio.on("final_chance")
+def on_final_chance(data):
+    """Relay: sender's own last-card deduction failed — give the partner
+    their one guaranteed shot at the sender's secret."""
+    partner_sid = matches.get(request.sid)
+    if partner_sid:
+        socketio.emit("final_chance", {}, to=partner_sid)
+
+
 @socketio.on("profile_data")
 def on_profile_data(data):
     """Relay a player's profile to their matched partner."""
