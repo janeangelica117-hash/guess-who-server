@@ -240,6 +240,16 @@ def on_final_chance(data):
         socketio.emit("final_chance", {}, to=partner_sid)
 
 
+@socketio.on("category_select")
+def on_category_select(data):
+    """Relay: host picked (or changed) the card category for this match."""
+    partner_sid = matches.get(request.sid)
+    if partner_sid:
+        socketio.emit("category_select", {
+            "category": data.get("category", "desserts"),
+        }, to=partner_sid)
+
+
 @socketio.on("profile_data")
 def on_profile_data(data):
     """Relay a player's profile to their matched partner."""
