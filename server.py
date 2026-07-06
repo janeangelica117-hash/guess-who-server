@@ -267,6 +267,19 @@ def on_chat_emoji(data):
         socketio.emit("chat_emoji", {"emoji": emoji}, to=partner_sid)
 
 
+@socketio.on("chat_message")
+def on_chat_message(data):
+    """Relay a free-text lobby chat message to the matched partner."""
+    partner_sid = matches.get(request.sid)
+    sender_username = players.get(request.sid, "")
+    text = str(data.get("text", "")).strip()[:300]
+    if partner_sid and text:
+        socketio.emit("chat_message", {
+            "from": sender_username,
+            "text": text,
+        }, to=partner_sid)
+
+
 @socketio.on("disconnect")
 def on_disconnect():
     username = players.pop(request.sid, "unknown")
