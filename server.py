@@ -1,4 +1,6 @@
 import os
+import random
+import uuid
 from flask import Flask, request
 from flask_socketio import SocketIO, emit
 
@@ -14,6 +16,20 @@ matches = {}
 # { socket_id: True } — tracks who is the host of their match
 hosts = {}
 
+# ── Imposter mode: separate room-based system (3-10 players), running
+# alongside the 1v1 matches above rather than replacing them ───────────────
+
+# { room_id: {
+#     host, members (list, join order = turn order source), category,
+#     started, secret_card, imposter_sid, imposter_card,
+#     round (0=lobby, 1-3=describing, 4=voting, 5=result),
+#     turn_order, turn_idx, votes {voter_sid: accused_sid}
+# } }
+imposter_rooms = {}
+
+# { socket_id: room_id } — reverse lookup for whichever room a player is in
+player_room = {}
+
 
 def broadcast_players():
     """Send each client the full player list with availability status."""
@@ -22,7 +38,7 @@ def broadcast_players():
         for s, u in players.items():
             if s == sid:
                 continue
-            status = "busy" if s in matches else "available"
+            status = "busy" if (s in matches or s in player_room) else "available"
             others.append({"username": u, "status": status})
         socketio.emit("update_players", others, to=sid)
 
@@ -291,8 +307,290 @@ def on_disconnect():
         hosts.pop(partner_sid,   None)
         socketio.emit("opponent_left", {}, to=partner_sid)
 
+    _imposter_remove_player(request.sid)
+
     print(f"[-] {username} left (sid={request.sid})")
     broadcast_players()
+
+
+# ── Imposter mode ────────────────────────────────────────────────────────────
+
+def _imposter_room_broadcast(room_id, event, data):
+    room = imposter_rooms.get(room_id)
+    if not room:
+        return
+    for sid in room["members"]:
+        socketio.emit(event, data, to=sid)
+
+
+def _imposter_room_public_state(room_id):
+    room = imposter_rooms[room_id]
+    return {
+        "room_id":  room_id,
+        "host":     players.get(room["host"], ""),
+        "members":  [players.get(s, "?") for s in room["members"]],
+        "category": room["category"],
+    }
+
+
+def _imposter_remove_player(sid):
+    """Shared cleanup for both an explicit leave and a disconnect."""
+    room_id = player_room.pop(sid, None)
+    if not room_id:
+        return
+    room = imposter_rooms.get(room_id)
+    if not room:
+        return
+    if sid in room["members"]:
+        room["members"].remove(sid)
+    if not room["members"]:
+        imposter_rooms.pop(room_id, None)
+        return
+    if room["host"] == sid:
+        room["host"] = room["members"][0]   # promote the next-longest member
+    if room["started"] and sid in room.get("turn_order", []):
+        # A player leaving mid-game shouldn't freeze everyone else's turn —
+        # just drop them from the turn order; round/turn_idx logic below
+        # already advances by index, so this keeps it self-consistent.
+        idx = room["turn_order"].index(sid)
+        room["turn_order"].remove(sid)
+        if idx < room["turn_idx"]:
+            room["turn_idx"] -= 1
+    _imposter_room_broadcast(room_id, "imposter_room_state", _imposter_room_public_state(room_id))
+
+
+@socketio.on("imposter_create_room")
+def on_imposter_create_room(data):
+    sid = request.sid
+    if sid in player_room:
+        return
+    room_id = uuid.uuid4().hex[:8]
+    imposter_rooms[room_id] = {
+        "host": sid, "members": [sid], "category": "desserts",
+        "started": False, "secret_card": None, "imposter_sid": None,
+        "imposter_card": None, "round": 0, "turn_order": [], "turn_idx": 0,
+        "votes": {},
+    }
+    player_room[sid] = room_id
+    socketio.emit("imposter_room_state", _imposter_room_public_state(room_id), to=sid)
+    broadcast_players()
+
+
+@socketio.on("imposter_invite")
+def on_imposter_invite(data):
+    """Any member of a room can invite any other available player in —
+    not host-only, unlike starting the game."""
+    sid = request.sid
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room or room["started"] or len(room["members"]) >= 10:
+        return
+
+    target_username = str(data.get("target", "")).strip()
+    target_sid = next((s for s, u in players.items() if u == target_username), None)
+    if not target_sid or target_sid in player_room or target_sid in matches:
+        socketio.emit("imposter_invite_response",
+                       {"accepted": False, "reason": "Player not available."}, to=sid)
+        return
+
+    socketio.emit("imposter_incoming_invite", {
+        "from": players.get(sid, ""), "room_id": room_id,
+    }, to=target_sid)
+
+
+@socketio.on("imposter_invite_accept")
+def on_imposter_invite_accept(data):
+    sid = request.sid
+    room_id = str(data.get("room_id", ""))
+    room = imposter_rooms.get(room_id)
+    if not room or room["started"] or len(room["members"]) >= 10 or sid in player_room:
+        return
+    room["members"].append(sid)
+    player_room[sid] = room_id
+    _imposter_room_broadcast(room_id, "imposter_room_state", _imposter_room_public_state(room_id))
+    broadcast_players()
+
+
+@socketio.on("imposter_invite_decline")
+def on_imposter_invite_decline(data):
+    sender_username = str(data.get("from", "")).strip()
+    sender_sid = next((s for s, u in players.items() if u == sender_username), None)
+    if sender_sid:
+        socketio.emit("imposter_invite_declined", {"by": players.get(request.sid, "")}, to=sender_sid)
+
+
+@socketio.on("imposter_leave_room")
+def on_imposter_leave_room(data):
+    _imposter_remove_player(request.sid)
+    broadcast_players()
+
+
+@socketio.on("imposter_kick")
+def on_imposter_kick(data):
+    """Host removes a member from the lobby (pre-game only)."""
+    sid = request.sid
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room or room["host"] != sid or room["started"]:
+        return
+    target_username = str(data.get("target", "")).strip()
+    target_sid = next((s for s in room["members"] if players.get(s) == target_username), None)
+    if not target_sid or target_sid == sid:
+        return
+    _imposter_remove_player(target_sid)
+    socketio.emit("imposter_kicked", {"by": players.get(sid, "")}, to=target_sid)
+    broadcast_players()
+
+
+@socketio.on("imposter_category_select")
+def on_imposter_category_select(data):
+    sid = request.sid
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room or room["host"] != sid or room["started"]:
+        return
+    room["category"] = str(data.get("category", "desserts")).strip() or "desserts"
+    _imposter_room_broadcast(room_id, "imposter_room_state", _imposter_room_public_state(room_id))
+
+
+@socketio.on("imposter_start_game")
+def on_imposter_start_game(data):
+    """Host only. Needs 3-10 members. The two card names (the real one
+    everyone-but-the-imposter gets, and the different one the imposter
+    gets) come from the host's client, same trust model as the 1v1 game's
+    'secret' event — the server never needs to know real card data, only
+    who gets matched with who."""
+    sid = request.sid
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room or room["host"] != sid or room["started"]:
+        return
+    if not (3 <= len(room["members"]) <= 10):
+        socketio.emit("imposter_start_failed", {"reason": "Need 3 to 10 players to start."}, to=sid)
+        return
+
+    cards = data.get("cards") or {}
+    real_card     = str(cards.get("real", "")).strip()
+    imposter_card = str(cards.get("imposter", "")).strip()
+    if not real_card or not imposter_card or real_card == imposter_card:
+        return
+
+    members = list(room["members"])
+    imposter_sid = random.choice(members)
+    turn_order = members[:]
+    random.shuffle(turn_order)
+
+    room.update({
+        "started": True, "secret_card": real_card, "imposter_sid": imposter_sid,
+        "imposter_card": imposter_card, "round": 1, "turn_order": turn_order,
+        "turn_idx": 0, "votes": {},
+    })
+
+    for m_sid in members:
+        socketio.emit("imposter_game_started", {
+            "your_card":  imposter_card if m_sid == imposter_sid else real_card,
+            "is_imposter": (m_sid == imposter_sid),
+            "turn_order": [players.get(s, "?") for s in turn_order],
+            "category":   room["category"],
+        }, to=m_sid)
+
+    print(f"[imposter] room {room_id} started: {len(members)} players, imposter is {players.get(imposter_sid)}")
+    _imposter_announce_turn(room_id)
+
+
+def _imposter_announce_turn(room_id):
+    room = imposter_rooms[room_id]
+    current_sid = room["turn_order"][room["turn_idx"]]
+    _imposter_room_broadcast(room_id, "imposter_turn", {
+        "player": players.get(current_sid, "?"),
+        "round":  room["round"],
+    })
+
+
+@socketio.on("imposter_description")
+def on_imposter_description(data):
+    """Current describer submits their line for this round — relayed to
+    the room, then advances to the next player, next round, or (after
+    round 3) into voting."""
+    sid = request.sid
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room or not room["started"] or room["round"] > 3:
+        return
+    if not room["turn_order"] or room["turn_order"][room["turn_idx"]] != sid:
+        return   # not this player's turn
+
+    text = str(data.get("text", "")).strip()[:200]
+    if not text:
+        return
+
+    _imposter_room_broadcast(room_id, "imposter_description", {
+        "player": players.get(sid, "?"), "text": text, "round": room["round"],
+    })
+
+    room["turn_idx"] += 1
+    if room["turn_idx"] >= len(room["turn_order"]):
+        room["turn_idx"] = 0
+        room["round"] += 1
+        if room["round"] > 3:
+            room["round"] = 4
+            _imposter_room_broadcast(room_id, "imposter_voting_start", {
+                "players": [players.get(s, "?") for s in room["members"]],
+            })
+            return
+    _imposter_announce_turn(room_id)
+
+
+@socketio.on("imposter_vote")
+def on_imposter_vote(data):
+    sid = request.sid
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room or room["round"] != 4 or sid in room["votes"]:
+        return
+    accused_username = str(data.get("accused", "")).strip()
+    accused_sid = next((s for s in room["members"] if players.get(s) == accused_username), None)
+    if not accused_sid:
+        return
+    room["votes"][sid] = accused_sid
+
+    if len(room["votes"]) >= len(room["members"]):
+        _imposter_resolve_vote(room_id)
+
+
+def _imposter_resolve_vote(room_id):
+    room = imposter_rooms[room_id]
+    tally = {}
+    for accused_sid in room["votes"].values():
+        tally[accused_sid] = tally.get(accused_sid, 0) + 1
+    top_count = max(tally.values())
+    top_sids  = [s for s, c in tally.items() if c == top_count]
+    caught    = (len(top_sids) == 1 and top_sids[0] == room["imposter_sid"])
+
+    room["round"] = 5
+    _imposter_room_broadcast(room_id, "imposter_result", {
+        "caught":    caught,
+        "imposter":  players.get(room["imposter_sid"], "?"),
+        "real_card": room["secret_card"],
+        "votes":     {players.get(v, "?"): players.get(a, "?") for v, a in room["votes"].items()},
+    })
+
+
+@socketio.on("imposter_play_again")
+def on_imposter_play_again(data):
+    """Host resets the room back to its lobby state so the same group can
+    play another round without everyone re-inviting each other."""
+    sid = request.sid
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room or room["host"] != sid:
+        return
+    room.update({
+        "started": False, "secret_card": None, "imposter_sid": None,
+        "imposter_card": None, "round": 0, "turn_order": [], "turn_idx": 0,
+        "votes": {},
+    })
+    _imposter_room_broadcast(room_id, "imposter_room_state", _imposter_room_public_state(room_id))
 
 
 if __name__ == "__main__":
