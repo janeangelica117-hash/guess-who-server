@@ -453,6 +453,39 @@ def on_imposter_category_select(data):
     _imposter_room_broadcast(room_id, "imposter_room_state", _imposter_room_public_state(room_id))
 
 
+@socketio.on("imposter_chat_message")
+def on_imposter_chat_message(data):
+    """Free-text lobby chat, relayed to every member of the room (mirrors
+    the 1v1 game's chat_message, just broadcast instead of 1-to-1)."""
+    sid = request.sid
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room:
+        return
+    text = str(data.get("text", "")).strip()[:300]
+    if not text:
+        return
+    _imposter_room_broadcast(room_id, "imposter_chat_message", {
+        "from": players.get(sid, ""), "text": text,
+    })
+
+
+@socketio.on("imposter_chat_emoji")
+def on_imposter_chat_emoji(data):
+    """Emoji reaction, relayed to every member of the room."""
+    sid = request.sid
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room:
+        return
+    emoji = str(data.get("emoji", "")).strip()
+    if not emoji:
+        return
+    _imposter_room_broadcast(room_id, "imposter_chat_emoji", {
+        "from": players.get(sid, ""), "emoji": emoji,
+    })
+
+
 @socketio.on("imposter_start_game")
 def on_imposter_start_game(data):
     """Host only. Needs 3-10 members. The two card names (the real one
