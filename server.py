@@ -38,7 +38,7 @@ def broadcast_players():
         for s, u in players.items():
             if s == sid:
                 continue
-            status = "busy" if (s in matches or s in player_room) else "available"
+            status = "busy" if (s in matches or (s in player_room and imposter_rooms.get(player_room[s], {}).get("started"))) else "available"
             others.append({"username": u, "status": status})
         socketio.emit("update_players", others, to=sid)
 
@@ -484,6 +484,22 @@ def on_imposter_chat_emoji(data):
     _imposter_room_broadcast(room_id, "imposter_chat_emoji", {
         "from": players.get(sid, ""), "emoji": emoji,
     })
+
+
+@socketio.on("imposter_profile_data")
+def on_imposter_profile_data(data):
+    """Broadcast a player's avatar/profile to every other member of their
+    room, so real avatars can render for everyone in the Multiplayer Lobby
+    grid, not just yourself. Mirrors the 1v1 game's profile_data relay,
+    just to the whole room instead of a single matched partner."""
+    sid = request.sid
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room:
+        return
+    payload = dict(data)
+    payload["from"] = players.get(sid, "")
+    _imposter_room_broadcast(room_id, "imposter_profile_data", payload)
 
 
 @socketio.on("imposter_start_game")
