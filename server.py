@@ -1,6 +1,8 @@
 import os
 import random
 import uuid
+import sqlite3
+import time as _time
 from flask import Flask, request
 from flask_socketio import SocketIO, emit
 
@@ -15,6 +17,99 @@ matches = {}
 
 # { socket_id: True } — tracks who is the host of their match
 hosts = {}
+
+# ── Accounts: persistent identity, points, and usernames ───────────────────
+# Keyed by a device_id the client generates once and keeps locally (see
+# main.py) rather than by socket id, since sockets don't survive a
+# reconnect. google_id sits ready and unused for now — wiring up real
+# Google Sign-In later means filling this column in during on_identify,
+# nothing else about the schema or the rest of this flow has to change.
+DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "accounts.db")
+WIN_POINTS  = 5
+RENAME_COST = 20
+
+
+def _db():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def _init_db():
+    with _db() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS accounts (
+                device_id        TEXT PRIMARY KEY,
+                google_id        TEXT UNIQUE,
+                username         TEXT UNIQUE NOT NULL,
+                points           INTEGER NOT NULL DEFAULT 0,
+                has_set_username INTEGER NOT NULL DEFAULT 0,
+                created_at       TEXT NOT NULL
+            )
+        """)
+
+
+_init_db()
+
+# { socket_id: device_id } — who to credit when a game this socket is
+# playing in ends. Populated by on_identify, cleared on disconnect.
+device_ids = {}
+
+# { frozenset({sid_a, sid_b}): {"sid": claimant_sid, "result": "WIN"/"LOSE"/"FORFEIT"} }
+# A 1v1 game_over is one client's self-report, so it sits here until the
+# other client's own ack corroborates (or contradicts) it — see
+# _resolve_1v1_points. Imposter mode doesn't need this: the server already
+# decides who got caught on its own.
+pending_game_results = {}
+
+
+def _unique_account_username(base):
+    base = (base or "Player").strip() or "Player"
+    with _db() as conn:
+        candidate, n = base, 2
+        while conn.execute("SELECT 1 FROM accounts WHERE username = ?", (candidate,)).fetchone():
+            candidate = f"{base}{n}"
+            n += 1
+        return candidate
+
+
+def _get_or_create_account(device_id):
+    with _db() as conn:
+        row = conn.execute("SELECT * FROM accounts WHERE device_id = ?", (device_id,)).fetchone()
+        if row:
+            return dict(row)
+        username = _unique_account_username("Player")
+        conn.execute(
+            "INSERT INTO accounts (device_id, username, points, has_set_username, created_at) "
+            "VALUES (?, ?, 0, 0, ?)",
+            (device_id, username, _time.strftime("%Y-%m-%d %H:%M:%S")),
+        )
+        conn.commit()
+        return dict(conn.execute("SELECT * FROM accounts WHERE device_id = ?", (device_id,)).fetchone())
+
+
+def _award_points(device_id, amount):
+    if not device_id or not amount:
+        return
+    with _db() as conn:
+        conn.execute("UPDATE accounts SET points = points + ? WHERE device_id = ?", (amount, device_id))
+        conn.commit()
+
+
+def _resolve_1v1_points(sid_a, result_a, sid_b, result_b):
+    """Award the win only when both sides' self-reported outcomes are
+    consistent with each other. A single modified client can no longer
+    farm points for free — the untouched opponent's client will report
+    the opposite outcome, and anything that doesn't cleanly resolve to
+    exactly one winner is left unresolved rather than guessed at."""
+    pair = {result_a, result_b}
+    winner_sid = None
+    if pair == {"WIN", "LOSE"}:
+        winner_sid = sid_a if result_a == "WIN" else sid_b
+    elif "FORFEIT" in pair and pair != {"FORFEIT"}:
+        winner_sid = sid_a if result_a != "FORFEIT" else sid_b
+    if winner_sid:
+        _award_points(device_ids.get(winner_sid), WIN_POINTS)
 
 # ── Imposter mode: separate room-based system (3-10 players), running
 # alongside the 1v1 matches above rather than replacing them ───────────────
@@ -57,6 +152,82 @@ def on_join(data):
     players[request.sid] = username
     print(f"[+] {username} joined (sid={request.sid})")
     broadcast_players()
+
+
+@socketio.on("identify")
+def on_identify(data):
+    """First thing a client does after connecting: exchange its locally
+    persisted device_id for a real account (points + username), creating
+    one on first contact. This is the seam Google Sign-In slots into
+    later — swap this lookup for a verified Google account id and nothing
+    else about the rest of this flow has to change."""
+    device_id = str(data.get("device_id", "")).strip()
+    if not device_id:
+        return
+    device_ids[request.sid] = device_id
+    account = _get_or_create_account(device_id)
+    # The socket already joined under a throwaway default name (see
+    # main.py) before this account lookup could complete — now that we
+    # know the persisted one, make the "who's online" list reflect it too.
+    if request.sid in players and players[request.sid] != account["username"]:
+        players[request.sid] = account["username"]
+        broadcast_players()
+    emit("identify_result", {
+        "username": account["username"],
+        "points": account["points"],
+        "has_set_username": bool(account["has_set_username"]),
+        "rename_cost": RENAME_COST,
+    })
+
+
+@socketio.on("set_username")
+def on_set_username(data):
+    device_id = device_ids.get(request.sid, "")
+    if not device_id:
+        emit("set_username_result", {"ok": False, "reason": "Not identified yet."})
+        return
+    new_name = str(data.get("username", "")).strip()[:20]
+    if not new_name:
+        emit("set_username_result", {"ok": False, "reason": "Enter a name."})
+        return
+
+    with _db() as conn:
+        account = conn.execute("SELECT * FROM accounts WHERE device_id = ?", (device_id,)).fetchone()
+        if not account:
+            emit("set_username_result", {"ok": False, "reason": "Account not found."})
+            return
+        if conn.execute(
+            "SELECT 1 FROM accounts WHERE username = ? AND device_id != ?", (new_name, device_id)
+        ).fetchone():
+            emit("set_username_result", {"ok": False, "reason": "That name is taken."})
+            return
+
+        first_time = not account["has_set_username"]
+        if first_time:
+            conn.execute(
+                "UPDATE accounts SET username = ?, has_set_username = 1 WHERE device_id = ?",
+                (new_name, device_id),
+            )
+        else:
+            if account["points"] < RENAME_COST:
+                emit("set_username_result", {
+                    "ok": False,
+                    "reason": f"Need {RENAME_COST} points to change your name.",
+                    "points": account["points"],
+                })
+                return
+            conn.execute(
+                "UPDATE accounts SET username = ?, points = points - ? WHERE device_id = ?",
+                (new_name, RENAME_COST, device_id),
+            )
+        conn.commit()
+        account = dict(conn.execute("SELECT * FROM accounts WHERE device_id = ?", (device_id,)).fetchone())
+
+    # Keep the ephemeral "who's online" name in sync too, so the Friends
+    # list and any room reflect the change right away.
+    players[request.sid] = new_name
+    broadcast_players()
+    emit("set_username_result", {"ok": True, "username": new_name, "points": account["points"]})
 
 
 @socketio.on("invite")
@@ -237,7 +408,9 @@ def on_end_turn(data):
 
 @socketio.on("game_over")
 def on_game_over(data):
-    """Relay a game-over result to the partner."""
+    """Relay a game-over result to the partner, and stage it for the
+    corroborated points check once the partner's own ack comes back (see
+    _resolve_1v1_points) — the win itself isn't paid out here."""
     partner_sid = matches.get(request.sid)
     if partner_sid:
         socketio.emit("game_over", {
@@ -245,6 +418,24 @@ def on_game_over(data):
             "reason": data.get("reason", ""),
             "secret": data.get("secret", ""),   # sender's secret dessert name
         }, to=partner_sid)
+        pending_game_results[frozenset((request.sid, partner_sid))] = {
+            "sid": request.sid, "result": data.get("result", ""),
+        }
+
+
+@socketio.on("game_over_ack")
+def on_game_over_ack(data):
+    """The receiving side's own view of how the game ended. Never
+    re-relayed (the original game_over already told them the outcome) —
+    used only so the server can compare both sides before paying out."""
+    sid = request.sid
+    key = next((k for k in pending_game_results if sid in k), None)
+    if not key:
+        return
+    entry = pending_game_results.pop(key)
+    if entry["sid"] == sid:
+        return   # an ack should come from the OTHER side, not the original claimant
+    _resolve_1v1_points(entry["sid"], entry["result"], sid, data.get("result", ""))
 
 
 @socketio.on("final_chance")
@@ -301,6 +492,9 @@ def on_disconnect():
     username = players.pop(request.sid, "unknown")
     partner_sid = matches.pop(request.sid, None)
     hosts.pop(request.sid, None)
+    device_ids.pop(request.sid, None)
+    for key in [k for k in pending_game_results if request.sid in k]:
+        pending_game_results.pop(key, None)   # no ack is coming now — leave it unresolved
 
     if partner_sid:
         matches.pop(partner_sid, None)
@@ -615,6 +809,13 @@ def _imposter_resolve_vote(room_id):
     top_count = max(tally.values())
     top_sids  = [s for s, c in tally.items() if c == top_count]
     caught    = (len(top_sids) == 1 and top_sids[0] == room["imposter_sid"])
+
+    # Server-decided outcome, unlike 1v1's self-reported one — safe to pay
+    # out directly. Caught: everyone but the imposter wins. Not caught:
+    # just the imposter does.
+    winners = [s for s in room["members"] if s != room["imposter_sid"]] if caught else [room["imposter_sid"]]
+    for sid in winners:
+        _award_points(device_ids.get(sid), WIN_POINTS)
 
     room["round"] = 5
     _imposter_room_broadcast(room_id, "imposter_result", {
