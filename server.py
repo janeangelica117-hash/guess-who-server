@@ -489,11 +489,20 @@ def on_chat_message(data):
 
 @socketio.on("disconnect")
 def on_disconnect():
-    username = players.pop(request.sid, "unknown")
-    partner_sid = matches.pop(request.sid, None)
-    hosts.pop(request.sid, None)
-    device_ids.pop(request.sid, None)
-    for key in [k for k in pending_game_results if request.sid in k]:
+    sid = request.sid
+    username = players.get(sid, "unknown")
+
+    # Do this before anything below removes sid from players/device_ids —
+    # _imposter_remove_player can trigger _imposter_resolve_vote (if this
+    # disconnect is what completes the vote), which needs both still
+    # intact to report the right username and award points correctly.
+    _imposter_remove_player(sid)
+
+    players.pop(sid, None)
+    partner_sid = matches.pop(sid, None)
+    hosts.pop(sid, None)
+    device_ids.pop(sid, None)
+    for key in [k for k in pending_game_results if sid in k]:
         pending_game_results.pop(key, None)   # no ack is coming now — leave it unresolved
 
     if partner_sid:
@@ -501,9 +510,7 @@ def on_disconnect():
         hosts.pop(partner_sid,   None)
         socketio.emit("opponent_left", {}, to=partner_sid)
 
-    _imposter_remove_player(request.sid)
-
-    print(f"[-] {username} left (sid={request.sid})")
+    print(f"[-] {username} left (sid={sid})")
     broadcast_players()
 
 
@@ -550,6 +557,12 @@ def _imposter_remove_player(sid):
         room["turn_order"].remove(sid)
         if idx < room["turn_idx"]:
             room["turn_idx"] -= 1
+    if room["round"] == 4 and len(room["votes"]) >= len(room["members"]):
+        # Someone left mid-vote without ever casting one — the denominator
+        # just shrank to match what's already been cast, which is what was
+        # actually leaving everyone else stuck on "waiting on the room".
+        _imposter_resolve_vote(room_id)
+        return
     _imposter_room_broadcast(room_id, "imposter_room_state", _imposter_room_public_state(room_id))
 
 
