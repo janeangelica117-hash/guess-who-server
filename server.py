@@ -6,6 +6,12 @@ import time as _time
 from flask import Flask, request
 from flask_socketio import SocketIO, emit
 
+from game_logging import setup_logging, log_event
+import logging
+
+setup_logging()
+logger = logging.getLogger("guesswho")
+
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
 
@@ -17,6 +23,12 @@ matches = {}
 
 # { socket_id: True } — tracks who is the host of their match
 hosts = {}
+
+# { frozenset({sid_a, sid_b}): {"players": (name_a, name_b), "category": str|None,
+#   "started_at": float|None, "questions": int} } — per-1v1-match info that
+# exists purely for gameplay logging (see log_event calls below); has no
+# effect on how the match is actually played.
+match_meta = {}
 
 # ── Accounts: persistent identity, points, and usernames ───────────────────
 # Keyed by a device_id the client generates once and keeps locally (see
@@ -150,7 +162,7 @@ def on_join(data):
     if not username:
         return
     players[request.sid] = username
-    print(f"[+] {username} joined (sid={request.sid})")
+    logger.info(f"{username} joined (sid={request.sid})")
     broadcast_players()
 
 
@@ -268,10 +280,17 @@ def on_invite_accept(data):
     # Sender is the host
     hosts[sender_sid] = True
 
+    match_meta[frozenset((sender_sid, accepter_sid))] = {
+        "players": (sender_username, accepter_username),
+        "category": None,
+        "started_at": None,
+        "questions": 0,
+    }
+
     socketio.emit("matched", {"opponent": accepter_username, "is_host": True},  to=sender_sid)
     socketio.emit("matched", {"opponent": sender_username,   "is_host": False}, to=accepter_sid)
 
-    print(f"[match] {sender_username} (host) <-> {accepter_username}")
+    logger.info(f"match formed: {sender_username} (host) <-> {accepter_username}")
     broadcast_players()
 
 
@@ -303,7 +322,18 @@ def on_leave_match(data):
         # Tell the partner to return to lobby
         socketio.emit("partner_left_match", {}, to=partner_sid)
 
-    print(f"[leave_match] {players.get(leaver_sid, '?')} left the match")
+    meta = match_meta.pop(frozenset((leaver_sid, partner_sid)), None) if partner_sid else None
+    if meta and meta["started_at"]:
+        # They left after the game actually started, not just lobby chit-chat —
+        # worth knowing how often that happens vs. a clean game_over.
+        log_event(
+            "match_abandoned", players=meta["players"], category=meta["category"],
+            left_by=players.get(leaver_sid, "?"), reason="left_match",
+            duration_sec=round(_time.time() - meta["started_at"], 1),
+            questions_asked=meta["questions"],
+        )
+
+    logger.info(f"{players.get(leaver_sid, '?')} left the match")
     broadcast_players()
 
 
@@ -327,13 +357,14 @@ def on_kick(data):
     matches.pop(kicker_sid,   None)
     matches.pop(partner_sid,  None)
     hosts.pop(kicker_sid,     None)
+    match_meta.pop(frozenset((kicker_sid, partner_sid)), None)
 
     # Notify kicked player
     socketio.emit("kicked", {"by": kicker_username}, to=partner_sid)
     # Notify host that kick succeeded
     socketio.emit("kick_success", {"player": partner_username}, to=kicker_sid)
 
-    print(f"[kick] {kicker_username} kicked {partner_username}")
+    logger.info(f"{kicker_username} kicked {partner_username}")
     broadcast_players()
 
 
@@ -351,7 +382,11 @@ def on_game_start(data):
         return
 
     starter_username = players.get(starter_sid, "")
-    print(f"[start] {starter_username} started the game")
+    meta = match_meta.get(frozenset((starter_sid, partner_sid)))
+    if meta:
+        meta["started_at"] = _time.time()
+
+    logger.info(f"{starter_username} started the game")
     socketio.emit("game_started", {}, to=partner_sid)
 
 
@@ -381,6 +416,10 @@ def on_question(data):
     """Relay a question from the asker to the answerer."""
     partner_sid = matches.get(request.sid)
     if partner_sid:
+        meta = match_meta.get(frozenset((request.sid, partner_sid)))
+        if meta:
+            meta["questions"] += 1
+        logger.debug(f"question {players.get(request.sid,'?')} -> {players.get(partner_sid,'?')}: {data.get('text','')!r}")
         socketio.emit("question", {
             "text":   data.get("text", ""),
             "secret": data.get("secret", ""),   # opponent's secret, piggybacked
@@ -422,6 +461,18 @@ def on_game_over(data):
             "sid": request.sid, "result": data.get("result", ""),
         }
 
+        meta = match_meta.pop(frozenset((request.sid, partner_sid)), None)
+        log_event(
+            "match_end",
+            players=meta["players"] if meta else (players.get(request.sid, "?"), players.get(partner_sid, "?")),
+            category=meta["category"] if meta else None,
+            result=data.get("result", ""),
+            reason=data.get("reason", ""),
+            reported_by=players.get(request.sid, "?"),
+            duration_sec=round(_time.time() - meta["started_at"], 1) if meta and meta["started_at"] else None,
+            questions_asked=meta["questions"] if meta else None,
+        )
+
 
 @socketio.on("game_over_ack")
 def on_game_over_ack(data):
@@ -452,9 +503,11 @@ def on_category_select(data):
     """Relay: host picked (or changed) the card category for this match."""
     partner_sid = matches.get(request.sid)
     if partner_sid:
-        socketio.emit("category_select", {
-            "category": data.get("category", "desserts"),
-        }, to=partner_sid)
+        category = data.get("category", "desserts")
+        meta = match_meta.get(frozenset((request.sid, partner_sid)))
+        if meta:
+            meta["category"] = category
+        socketio.emit("category_select", {"category": category}, to=partner_sid)
 
 
 @socketio.on("profile_data")
@@ -510,7 +563,16 @@ def on_disconnect():
         hosts.pop(partner_sid,   None)
         socketio.emit("opponent_left", {}, to=partner_sid)
 
-    print(f"[-] {username} left (sid={sid})")
+        meta = match_meta.pop(frozenset((sid, partner_sid)), None)
+        if meta and meta["started_at"]:
+            log_event(
+                "match_abandoned", players=meta["players"], category=meta["category"],
+                left_by=username, reason="disconnect",
+                duration_sec=round(_time.time() - meta["started_at"], 1),
+                questions_asked=meta["questions"],
+            )
+
+    logger.info(f"{username} left (sid={sid})")
     broadcast_players()
 
 
@@ -545,6 +607,13 @@ def _imposter_remove_player(sid):
     if sid in room["members"]:
         room["members"].remove(sid)
     if not room["members"]:
+        if room["started"] and room["round"] != 5:
+            # Room emptied out mid-round — nobody ever got a result.
+            log_event(
+                "imposter_match_abandoned", room_id=room_id, category=room["category"],
+                last_to_leave=players.get(sid, "?"),
+                duration_sec=round(_time.time() - room["started_at"], 1) if room.get("started_at") else None,
+            )
         imposter_rooms.pop(room_id, None)
         return
     if room["host"] == sid:
@@ -576,7 +645,7 @@ def on_imposter_create_room(data):
         "host": sid, "members": [sid], "category": "desserts",
         "started": False, "secret_card": None, "imposter_sid": None,
         "imposter_card": None, "round": 0, "turn_order": [], "turn_idx": 0,
-        "votes": {},
+        "votes": {}, "started_at": None,
     }
     player_room[sid] = room_id
     socketio.emit("imposter_room_state", _imposter_room_public_state(room_id), to=sid)
@@ -739,7 +808,7 @@ def on_imposter_start_game(data):
     room.update({
         "started": True, "secret_card": real_card, "imposter_sid": imposter_sid,
         "imposter_card": imposter_card, "round": 1, "turn_order": turn_order,
-        "turn_idx": 0, "votes": {},
+        "turn_idx": 0, "votes": {}, "started_at": _time.time(),
     })
 
     for m_sid in members:
@@ -750,7 +819,7 @@ def on_imposter_start_game(data):
             "category":   room["category"],
         }, to=m_sid)
 
-    print(f"[imposter] room {room_id} started: {len(members)} players, imposter is {players.get(imposter_sid)}")
+    logger.info(f"imposter room {room_id} started: {len(members)} players, imposter is {players.get(imposter_sid)}")
     _imposter_announce_turn(room_id)
 
 
@@ -837,6 +906,16 @@ def _imposter_resolve_vote(room_id):
         "real_card": room["secret_card"],
         "votes":     {players.get(v, "?"): players.get(a, "?") for v, a in room["votes"].items()},
     })
+
+    log_event(
+        "imposter_match_end",
+        room_id=room_id,
+        members=[players.get(s, "?") for s in room["members"]],
+        category=room["category"],
+        imposter=players.get(room["imposter_sid"], "?"),
+        caught=caught,
+        duration_sec=round(_time.time() - room["started_at"], 1) if room.get("started_at") else None,
+    )
 
 
 @socketio.on("imposter_play_again")
