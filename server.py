@@ -3,10 +3,10 @@ import random
 import uuid
 import sqlite3
 import time as _time
-from flask import Flask, request
+from flask import Flask, request, send_file, abort
 from flask_socketio import SocketIO, emit
 
-from game_logging import setup_logging, log_event
+from game_logging import setup_logging, log_event, GAME_HISTORY_PATH
 import logging
 
 setup_logging()
@@ -14,6 +14,24 @@ logger = logging.getLogger("guesswho")
 
 app = Flask(__name__)
 socketio = SocketIO(app, cors_allowed_origins="*")
+
+# Set this as an environment variable on Northflank (Service -> Environment)
+# to view/download logs/game_history.txt at /admin/game-history?key=...
+# Left unset, the route is disabled — no key means no access, not open access.
+ADMIN_KEY = os.environ.get("ADMIN_KEY")
+
+
+@app.route("/admin/game-history")
+def admin_game_history():
+    if not ADMIN_KEY or request.args.get("key") != ADMIN_KEY:
+        abort(403)
+    if not os.path.exists(GAME_HISTORY_PATH):
+        return "No games recorded yet.", 200, {"Content-Type": "text/plain"}
+    # as_attachment=False so it opens right in the browser tab (readable);
+    # add ?download=1 to save it as a file instead.
+    as_attachment = request.args.get("download") == "1"
+    return send_file(GAME_HISTORY_PATH, mimetype="text/plain", as_attachment=as_attachment)
+
 
 # { socket_id: username }
 players = {}
