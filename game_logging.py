@@ -159,34 +159,107 @@ def _fmt_duration(seconds):
     return f"{m}m{s:02d}s" if m else f"{s}s"
 
 
+def _fmt_secrets(secrets):
+    if not secrets:
+        return None
+    return "Secrets — " + " | ".join(f"{player}: {card}" for player, card in secrets.items())
+
+
+def _fmt_transcript_1v1(transcript):
+    """Turn the 1v1 question/answer list into indented transcript lines,
+    numbering each question and nesting its answer underneath. NOTE: this
+    can't show card eliminations or in-progress guesses — those happen
+    entirely inside each player's own client and are never sent to the
+    server at all, so there's nothing here to log."""
+    lines = []
+    qn = 0
+    for entry in transcript:
+        if entry.get("type") == "question":
+            qn += 1
+            lines.append(f"  Q{qn}. {entry.get('player', '?')} asked: \"{entry.get('text', '')}\"")
+        elif entry.get("type") == "answer":
+            yn = "YES" if entry.get("yes") else "NO"
+            lines.append(f"      -> {entry.get('player', '?')} answered {yn}")
+    return lines
+
+
+def _fmt_transcript_imposter(transcript):
+    """Turn the imposter round's descriptions into lines grouped by round."""
+    lines = []
+    current_round = None
+    for entry in transcript:
+        r = entry.get("round")
+        if r != current_round:
+            current_round = r
+            lines.append(f"  Round {r}:")
+        lines.append(f"    {entry.get('player', '?')}: \"{entry.get('text', '')}\"")
+    return lines
+
+
 def _human_line(ts, event, f):
-    """Render one gameplay event as a single plain-English line."""
+    """Render one gameplay event as a readable block — one line for a
+    quick event, several lines (header, transcript, result) for a full
+    finished or abandoned game."""
     if event == "match_end":
         a, b = f.get("players", ("?", "?"))
-        return (f"{ts} | {a} vs {b} | category: {f.get('category') or '?'} | "
-                f"{f.get('reported_by', '?')} reported {f.get('result', '?')} "
-                f"({f.get('reason', '')}) | duration: {_fmt_duration(f.get('duration_sec'))} | "
-                f"questions asked: {f.get('questions_asked', '?')}")
+        lines = [
+            "=" * 78,
+            f"{ts} | 1v1 | {a} vs {b} | category: {f.get('category') or '?'} | "
+            f"duration: {_fmt_duration(f.get('duration_sec'))}",
+        ]
+        secrets_line = _fmt_secrets(f.get("secrets"))
+        if secrets_line:
+            lines.append(secrets_line)
+        lines.extend(_fmt_transcript_1v1(f.get("transcript", [])))
+        lines.append(f"RESULT: {f.get('reported_by', '?')} reported {f.get('result', '?')} "
+                     f"— {f.get('reason', '')}")
+        lines.append("=" * 78)
+        return "\n".join(lines)
 
     if event == "match_abandoned":
         a, b = f.get("players", ("?", "?"))
-        return (f"{ts} | {a} vs {b} | category: {f.get('category') or '?'} | "
-                f"ABANDONED — {f.get('left_by', '?')} ({f.get('reason', 'left')}) | "
-                f"duration: {_fmt_duration(f.get('duration_sec'))} | "
-                f"questions asked: {f.get('questions_asked', '?')}")
+        lines = [
+            "-" * 78,
+            f"{ts} | 1v1 ABANDONED | {a} vs {b} | category: {f.get('category') or '?'} | "
+            f"{f.get('left_by', '?')} left ({f.get('reason', 'left')}) | "
+            f"duration: {_fmt_duration(f.get('duration_sec'))}",
+        ]
+        secrets_line = _fmt_secrets(f.get("secrets"))
+        if secrets_line:
+            lines.append(secrets_line)
+        lines.extend(_fmt_transcript_1v1(f.get("transcript", [])))
+        lines.append("-" * 78)
+        return "\n".join(lines)
 
     if event == "imposter_match_end":
         members = ", ".join(f.get("members", []))
-        caught = "YES" if f.get("caught") else "NO"
-        return (f"{ts} | Imposter room {f.get('room_id', '?')} | players: {members} | "
-                f"category: {f.get('category') or '?'} | imposter: {f.get('imposter', '?')} | "
-                f"caught: {caught} | duration: {_fmt_duration(f.get('duration_sec'))}")
+        caught = "CAUGHT" if f.get("caught") else "NOT CAUGHT"
+        votes = f.get("votes") or {}
+        lines = [
+            "=" * 78,
+            f"{ts} | IMPOSTER | room {f.get('room_id', '?')} | players: {members} | "
+            f"category: {f.get('category') or '?'} | duration: {_fmt_duration(f.get('duration_sec'))}",
+            f"Real card: {f.get('real_card', '?')} | Imposter: {f.get('imposter', '?')} "
+            f"(bluffing with: {f.get('imposter_card', '?')})",
+        ]
+        lines.extend(_fmt_transcript_imposter(f.get("transcript", [])))
+        if votes:
+            lines.append("Votes: " + ", ".join(f"{voter} -> {accused}" for voter, accused in votes.items()))
+        lines.append(f"RESULT: {f.get('imposter', '?')} was {caught}")
+        lines.append("=" * 78)
+        return "\n".join(lines)
 
     if event == "imposter_match_abandoned":
-        return (f"{ts} | Imposter room {f.get('room_id', '?')} | "
-                f"category: {f.get('category') or '?'} | "
-                f"ABANDONED — {f.get('last_to_leave', '?')} was last to leave | "
-                f"duration: {_fmt_duration(f.get('duration_sec'))}")
+        lines = [
+            "-" * 78,
+            f"{ts} | IMPOSTER ABANDONED | room {f.get('room_id', '?')} | "
+            f"category: {f.get('category') or '?'} | "
+            f"{f.get('last_to_leave', '?')} was last to leave | "
+            f"duration: {_fmt_duration(f.get('duration_sec'))}",
+        ]
+        lines.extend(_fmt_transcript_imposter(f.get("transcript", [])))
+        lines.append("-" * 78)
+        return "\n".join(lines)
 
     if event == "bot_match_end":
         return (f"{ts} | {f.get('player', '?')} vs Bot | category: {f.get('category') or '?'} | "
@@ -204,11 +277,15 @@ def log_event(event, **fields):
     """Write one gameplay event, e.g.:
 
         log_event("match_end", players=("Alice", "Bob"), result="WIN",
-                   category="fruits", duration_sec=142.3, questions_asked=6)
+                   category="fruits", duration_sec=142.3,
+                   secrets={"Alice": "Apple", "Bob": "Banana"},
+                   transcript=[{"type": "question", "player": "Alice", "text": "..."},
+                               {"type": "answer", "player": "Bob", "yes": True}, ...])
 
-    This writes TWO copies: a JSON line to gameplay.log (for later
-    analysis) and a plain-English line to game_history.txt and the
-    console, if enabled (for just reading what happened).
+    This writes TWO copies: a JSON object to gameplay.log (for later
+    analysis — every field passed in rides along as-is) and a readable
+    block to game_history.txt and the console, if enabled (for just
+    reading what happened).
     """
     ts = time.strftime("%Y-%m-%d %H:%M:%S")
 

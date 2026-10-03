@@ -303,9 +303,10 @@ def on_invite_accept(data):
 
     match_meta[frozenset((sender_sid, accepter_sid))] = {
         "players": (sender_username, accepter_username),
-        "category": None,
+        "category": "desserts",  # the client's own default when nobody touches the picker
         "started_at": None,
-        "questions": 0,
+        "secrets": {},      # {username: secret card name}
+        "transcript": [],   # [{"type": "question"/"answer", "player": username, ...}]
     }
 
     socketio.emit("matched", {"opponent": accepter_username, "is_host": True},  to=sender_sid)
@@ -351,7 +352,7 @@ def on_leave_match(data):
             "match_abandoned", players=meta["players"], category=meta["category"],
             left_by=players.get(leaver_sid, "?"), reason="left_match",
             duration_sec=round(_time.time() - meta["started_at"], 1),
-            questions_asked=meta["questions"],
+            secrets=meta["secrets"], transcript=meta["transcript"],
         )
 
     logger.info(f"{players.get(leaver_sid, '?')} left the match")
@@ -429,7 +430,11 @@ def on_secret(data):
     """Relay a player's secret card name to their opponent."""
     partner_sid = matches.get(request.sid)
     if partner_sid:
-        socketio.emit("secret", {"name": data.get("name", "")}, to=partner_sid)
+        name = data.get("name", "")
+        meta = match_meta.get(frozenset((request.sid, partner_sid)))
+        if meta:
+            meta["secrets"][players.get(request.sid, "?")] = name
+        socketio.emit("secret", {"name": name}, to=partner_sid)
 
 
 @socketio.on("question")
@@ -437,10 +442,13 @@ def on_question(data):
     """Relay a question from the asker to the answerer."""
     partner_sid = matches.get(request.sid)
     if partner_sid:
+        text = data.get("text", "")
         meta = match_meta.get(frozenset((request.sid, partner_sid)))
         if meta:
-            meta["questions"] += 1
-        logger.debug(f"question {players.get(request.sid,'?')} -> {players.get(partner_sid,'?')}: {data.get('text','')!r}")
+            meta["transcript"].append({
+                "type": "question", "player": players.get(request.sid, "?"), "text": text,
+            })
+        logger.debug(f"question {players.get(request.sid,'?')} -> {players.get(partner_sid,'?')}: {text!r}")
         socketio.emit("question", {
             "text":   data.get("text", ""),
             "secret": data.get("secret", ""),   # opponent's secret, piggybacked
@@ -452,8 +460,14 @@ def on_answer(data):
     """Relay YES/NO answer back to the asker."""
     partner_sid = matches.get(request.sid)
     if partner_sid:
+        yes = bool(data.get("yes", False))
+        meta = match_meta.get(frozenset((request.sid, partner_sid)))
+        if meta:
+            meta["transcript"].append({
+                "type": "answer", "player": players.get(request.sid, "?"), "yes": yes,
+            })
         socketio.emit("answer", {
-            "yes":    bool(data.get("yes", False)),
+            "yes":    yes,
             "secret": data.get("secret", ""),   # opponent's secret, piggybacked
         }, to=partner_sid)
 
@@ -491,7 +505,8 @@ def on_game_over(data):
             reason=data.get("reason", ""),
             reported_by=players.get(request.sid, "?"),
             duration_sec=round(_time.time() - meta["started_at"], 1) if meta and meta["started_at"] else None,
-            questions_asked=meta["questions"] if meta else None,
+            secrets=meta["secrets"] if meta else {},
+            transcript=meta["transcript"] if meta else [],
         )
 
 
@@ -590,7 +605,7 @@ def on_disconnect():
                 "match_abandoned", players=meta["players"], category=meta["category"],
                 left_by=username, reason="disconnect",
                 duration_sec=round(_time.time() - meta["started_at"], 1),
-                questions_asked=meta["questions"],
+                secrets=meta["secrets"], transcript=meta["transcript"],
             )
 
     logger.info(f"{username} left (sid={sid})")
@@ -634,6 +649,7 @@ def _imposter_remove_player(sid):
                 "imposter_match_abandoned", room_id=room_id, category=room["category"],
                 last_to_leave=players.get(sid, "?"),
                 duration_sec=round(_time.time() - room["started_at"], 1) if room.get("started_at") else None,
+                transcript=room["transcript"],
             )
         imposter_rooms.pop(room_id, None)
         return
@@ -666,7 +682,7 @@ def on_imposter_create_room(data):
         "host": sid, "members": [sid], "category": "desserts",
         "started": False, "secret_card": None, "imposter_sid": None,
         "imposter_card": None, "round": 0, "turn_order": [], "turn_idx": 0,
-        "votes": {}, "started_at": None,
+        "votes": {}, "started_at": None, "transcript": [],
     }
     player_room[sid] = room_id
     socketio.emit("imposter_room_state", _imposter_room_public_state(room_id), to=sid)
@@ -870,6 +886,9 @@ def on_imposter_description(data):
     if not text:
         return
 
+    room["transcript"].append({
+        "round": room["round"], "player": players.get(sid, "?"), "text": text,
+    })
     _imposter_room_broadcast(room_id, "imposter_description", {
         "player": players.get(sid, "?"), "text": text, "round": room["round"],
     })
@@ -934,7 +953,11 @@ def _imposter_resolve_vote(room_id):
         members=[players.get(s, "?") for s in room["members"]],
         category=room["category"],
         imposter=players.get(room["imposter_sid"], "?"),
+        real_card=room["secret_card"],
+        imposter_card=room["imposter_card"],
         caught=caught,
+        votes={players.get(v, "?"): players.get(a, "?") for v, a in room["votes"].items()},
+        transcript=room["transcript"],
         duration_sec=round(_time.time() - room["started_at"], 1) if room.get("started_at") else None,
     )
 
@@ -951,7 +974,7 @@ def on_imposter_play_again(data):
     room.update({
         "started": False, "secret_card": None, "imposter_sid": None,
         "imposter_card": None, "round": 0, "turn_order": [], "turn_idx": 0,
-        "votes": {},
+        "votes": {}, "transcript": [],
     })
     _imposter_room_broadcast(room_id, "imposter_room_state", _imposter_room_public_state(room_id))
 
