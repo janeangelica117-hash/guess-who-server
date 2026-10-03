@@ -25,7 +25,10 @@ ADMIN_KEY = os.environ.get("ADMIN_KEY")
 def admin_game_history():
     if not ADMIN_KEY or request.args.get("key") != ADMIN_KEY:
         abort(403)
-    if not os.path.exists(GAME_HISTORY_PATH):
+    if not os.path.exists(GAME_HISTORY_PATH) or os.path.getsize(GAME_HISTORY_PATH) == 0:
+        # The log file gets created the instant the server starts (before
+        # any game is ever played), so checking existence alone isn't
+        # enough — it's always "there", just empty until a real game ends.
         return "No games recorded yet.", 200, {"Content-Type": "text/plain"}
     # as_attachment=False so it opens right in the browser tab (readable);
     # add ?download=1 to save it as a file instead.
