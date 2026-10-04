@@ -644,10 +644,21 @@ def _imposter_remove_player(sid):
         room["members"].remove(sid)
     if not room["members"]:
         if room["started"] and room["round"] != 5:
-            # Room emptied out mid-round — nobody ever got a result.
+            # Room emptied out mid-round — nobody ever got a result. Use the
+            # frozen original_members, not room["members"] (already emptied
+            # by the removals above), so the log still shows who was playing.
+            roster = room.get("original_members") or []
+            names  = room.get("original_names") or {}
+            roles = {
+                names.get(s, "?"): ("imposter" if s == room["imposter_sid"] else "innocent")
+                for s in roster
+            }
             log_event(
                 "imposter_match_abandoned", room_id=room_id, category=room["category"],
-                last_to_leave=players.get(sid, "?"),
+                members=[names.get(s, "?") for s in roster],
+                roles=roles,
+                real_card=room["secret_card"], imposter_card=room["imposter_card"],
+                last_to_leave=names.get(sid, players.get(sid, "?")),
                 duration_sec=round(_time.time() - room["started_at"], 1) if room.get("started_at") else None,
                 transcript=room["transcript"],
             )
@@ -683,6 +694,7 @@ def on_imposter_create_room(data):
         "started": False, "secret_card": None, "imposter_sid": None,
         "imposter_card": None, "round": 0, "turn_order": [], "turn_idx": 0,
         "votes": {}, "started_at": None, "transcript": [],
+        "original_members": [], "original_names": {},
     }
     player_room[sid] = room_id
     socketio.emit("imposter_room_state", _imposter_room_public_state(room_id), to=sid)
@@ -846,6 +858,13 @@ def on_imposter_start_game(data):
         "started": True, "secret_card": real_card, "imposter_sid": imposter_sid,
         "imposter_card": imposter_card, "round": 1, "turn_order": turn_order,
         "turn_idx": 0, "votes": {}, "started_at": _time.time(),
+        # Frozen roster for logging. "members" shrinks as people leave, and if
+        # several people disconnect in the same cascade (room emptying out),
+        # players.get(sid) for the earlier ones is ALREADY gone by the time
+        # the last disconnect triggers the abandoned-match log — so names
+        # need to be captured now, not resolved later.
+        "original_members": members,
+        "original_names": {s: players.get(s, "?") for s in members},
     })
 
     for m_sid in members:
@@ -947,16 +966,24 @@ def _imposter_resolve_vote(room_id):
         "votes":     {players.get(v, "?"): players.get(a, "?") for v, a in room["votes"].items()},
     })
 
+    roster = room.get("original_members") or room["members"]
+    names  = room.get("original_names") or {}
+    roles = {
+        names.get(s, "?"): ("imposter" if s == room["imposter_sid"] else "innocent")
+        for s in roster
+    }
     log_event(
         "imposter_match_end",
         room_id=room_id,
-        members=[players.get(s, "?") for s in room["members"]],
+        members=[names.get(s, "?") for s in roster],
         category=room["category"],
-        imposter=players.get(room["imposter_sid"], "?"),
+        roles=roles,
+        imposter=names.get(room["imposter_sid"], "?"),
         real_card=room["secret_card"],
         imposter_card=room["imposter_card"],
         caught=caught,
-        votes={players.get(v, "?"): players.get(a, "?") for v, a in room["votes"].items()},
+        winner=("innocents" if caught else "imposter"),
+        votes={names.get(v, "?"): names.get(a, "?") for v, a in room["votes"].items()},
         transcript=room["transcript"],
         duration_sec=round(_time.time() - room["started_at"], 1) if room.get("started_at") else None,
     )

@@ -191,9 +191,15 @@ def _fmt_transcript_imposter(transcript):
         r = entry.get("round")
         if r != current_round:
             current_round = r
-            lines.append(f"  Round {r}:")
-        lines.append(f"    {entry.get('player', '?')}: \"{entry.get('text', '')}\"")
+            lines.append(f"Round {r}")
+        lines.append(f"  {entry.get('player', '?')} description: \"{entry.get('text', '')}\"")
     return lines
+
+
+def _fmt_roles(roles, members):
+    """'Eve (imposter), Finn (innocent), Gus (innocent)' — in roster order,
+    falling back to 'unknown' for anyone roles didn't have a role for."""
+    return ", ".join(f"{m} ({roles.get(m, 'unknown')})" for m in members)
 
 
 def _human_line(ts, event, f):
@@ -232,31 +238,40 @@ def _human_line(ts, event, f):
         return "\n".join(lines)
 
     if event == "imposter_match_end":
-        members = ", ".join(f.get("members", []))
-        caught = "CAUGHT" if f.get("caught") else "NOT CAUGHT"
+        members = f.get("members", [])
+        roles = f.get("roles") or {}
         votes = f.get("votes") or {}
+        winner = "Innocents" if f.get("winner") == "innocents" else "Imposter"
         lines = [
             "=" * 78,
-            f"{ts} | IMPOSTER | room {f.get('room_id', '?')} | players: {members} | "
+            f"{ts} | IMPOSTER | {len(members)} players | {', '.join(members)} | "
             f"category: {f.get('category') or '?'} | duration: {_fmt_duration(f.get('duration_sec'))}",
-            f"Real card: {f.get('real_card', '?')} | Imposter: {f.get('imposter', '?')} "
-            f"(bluffing with: {f.get('imposter_card', '?')})",
+            _fmt_roles(roles, members),
+            f"Imposter secret: {f.get('imposter_card', '?')} | Innocent secret: {f.get('real_card', '?')}",
         ]
         lines.extend(_fmt_transcript_imposter(f.get("transcript", [])))
-        if votes:
-            lines.append("Votes: " + ", ".join(f"{voter} -> {accused}" for voter, accused in votes.items()))
-        lines.append(f"RESULT: {f.get('imposter', '?')} was {caught}")
+        lines.append("Who's the Imposter?")
+        for voter, accused in votes.items():
+            lines.append(f"  {voter} voted {accused}")
+        lines.append(f"WINNER: {winner} ({f.get('imposter', '?')} was "
+                     f"{'caught' if f.get('caught') else 'not caught'})")
         lines.append("=" * 78)
         return "\n".join(lines)
 
     if event == "imposter_match_abandoned":
+        members = f.get("members", [])
+        roles = f.get("roles") or {}
         lines = [
             "-" * 78,
-            f"{ts} | IMPOSTER ABANDONED | room {f.get('room_id', '?')} | "
+            f"{ts} | IMPOSTER ABANDONED | {len(members)} players | {', '.join(members)} | "
             f"category: {f.get('category') or '?'} | "
             f"{f.get('last_to_leave', '?')} was last to leave | "
             f"duration: {_fmt_duration(f.get('duration_sec'))}",
         ]
+        if roles:
+            lines.append(_fmt_roles(roles, members))
+        if f.get("real_card"):
+            lines.append(f"Imposter secret: {f.get('imposter_card', '?')} | Innocent secret: {f.get('real_card', '?')}")
         lines.extend(_fmt_transcript_imposter(f.get("transcript", [])))
         lines.append("-" * 78)
         return "\n".join(lines)
