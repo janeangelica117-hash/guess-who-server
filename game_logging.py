@@ -196,6 +196,15 @@ def _fmt_transcript_imposter(transcript):
     return lines
 
 
+def _fmt_powers(powers):
+    """One line per Imposter power-up used, in the order they happened."""
+    return [
+        f"  Round {p.get('round', '?')}: {p.get('player', '?')} used {p.get('label', p.get('power', '?'))} "
+        f"({p.get('cost', '?')} pts) \u2014 {p.get('detail', '')}"
+        for p in (powers or [])
+    ]
+
+
 def _fmt_roles(roles, members):
     """'Eve (imposter), Finn (innocent), Gus (innocent)' — in roster order,
     falling back to 'unknown' for anyone roles didn't have a role for."""
@@ -241,7 +250,8 @@ def _human_line(ts, event, f):
         members = f.get("members", [])
         roles = f.get("roles") or {}
         votes = f.get("votes") or {}
-        winner = "Innocents" if f.get("winner") == "innocents" else "Imposter"
+        winner = {"innocents": "Innocents",
+                  "original_imposter": "Original Imposter (after a swap)"}.get(f.get("winner"), "Imposter")
         lines = [
             "=" * 78,
             f"{ts} | IMPOSTER | {len(members)} players | {', '.join(members)} | "
@@ -250,11 +260,18 @@ def _human_line(ts, event, f):
             f"Imposter secret: {f.get('imposter_card', '?')} | Innocent secret: {f.get('real_card', '?')}",
         ]
         lines.extend(_fmt_transcript_imposter(f.get("transcript", [])))
+        if f.get("powers"):
+            lines.append("Powers used:")
+            lines.extend(_fmt_powers(f["powers"]))
         lines.append("Who's the Imposter?")
         for voter, accused in votes.items():
             lines.append(f"  {voter} voted {accused}")
-        lines.append(f"WINNER: {winner} ({f.get('imposter', '?')} was "
-                     f"{'caught' if f.get('caught') else 'not caught'})")
+        if f.get("winner") == "original_imposter":
+            lines.append(f"WINNER: {winner} \u2014 {f.get('original_imposter', '?')} was voted out, "
+                         f"but the Imposter title had been swapped onto {f.get('imposter', '?')}")
+        else:
+            lines.append(f"WINNER: {winner} ({f.get('imposter', '?')} was "
+                         f"{'caught' if f.get('caught') else 'not caught'})")
         lines.append("=" * 78)
         return "\n".join(lines)
 
@@ -273,6 +290,9 @@ def _human_line(ts, event, f):
         if f.get("real_card"):
             lines.append(f"Imposter secret: {f.get('imposter_card', '?')} | Innocent secret: {f.get('real_card', '?')}")
         lines.extend(_fmt_transcript_imposter(f.get("transcript", [])))
+        if f.get("powers"):
+            lines.append("Powers used:")
+            lines.extend(_fmt_powers(f["powers"]))
         lines.append("-" * 78)
         return "\n".join(lines)
 

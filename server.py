@@ -9,6 +9,13 @@ from flask_socketio import SocketIO, emit
 from game_logging import setup_logging, log_event, GAME_HISTORY_PATH
 import logging
 
+try:
+    # Pure-data module (no pygame) — the server only needs it to pick the
+    # random decoy card offered by the Imposter's "new secret" power.
+    from categories import get_cards as _get_category_cards
+except Exception:   # categories.py / its card files weren't deployed
+    _get_category_cards = None
+
 setup_logging()
 logger = logging.getLogger("guesswho")
 
@@ -157,6 +164,15 @@ imposter_rooms = {}
 
 # { socket_id: room_id } — reverse lookup for whichever room a player is in
 player_room = {}
+
+# ── Imposter power-ups ─────────────────────────────────────────────────────────
+# Everyone gets IMPOSTER_START_POINTS at the start of a game. Only whoever
+# currently holds the Imposter title can spend them, and each power can be
+# used once per game, during the describing rounds only. (These are per-game
+# "power points" — separate from the persistent account points in the DB.)
+IMPOSTER_START_POINTS = 50
+IMPOSTER_POWER_COSTS  = {"swap": 25, "choose": 10, "match": 50}
+IMPOSTER_POWER_LABELS = {"swap": "SWAP ROLE", "choose": "NEW SECRET", "match": "COPY CARD"}
 
 
 def broadcast_players():
@@ -661,6 +677,7 @@ def _imposter_remove_player(sid):
                 last_to_leave=names.get(sid, players.get(sid, "?")),
                 duration_sec=round(_time.time() - room["started_at"], 1) if room.get("started_at") else None,
                 transcript=room["transcript"],
+                powers=room.get("power_log", []),
             )
         imposter_rooms.pop(room_id, None)
         return
@@ -696,6 +713,7 @@ def on_imposter_create_room(data):
         "votes": {}, "started_at": None, "transcript": [],
         "original_members": [], "original_names": {},
     }
+    imposter_rooms[room_id].update(_imposter_blank_power_state())
     player_room[sid] = room_id
     socketio.emit("imposter_room_state", _imposter_room_public_state(room_id), to=sid)
     broadcast_players()
@@ -865,6 +883,16 @@ def on_imposter_start_game(data):
         # need to be captured now, not resolved later.
         "original_members": members,
         "original_names": {s: players.get(s, "?") for s in members},
+        # ── power-up state ──
+        # original_imposter_sid never changes; imposter_sid moves if someone
+        # uses SWAP ROLE. player_cards is what each player is CURRENTLY
+        # looking at (the imposter's can change mid-game).
+        "original_imposter_sid": imposter_sid,
+        "player_cards": {s: (imposter_card if s == imposter_sid else real_card) for s in members},
+        "points": {s: IMPOSTER_START_POINTS for s in members},
+        "powers_used": {s: set() for s in members},
+        "pending_choices": {},
+        "power_log": [],
     })
 
     for m_sid in members:
@@ -873,6 +901,7 @@ def on_imposter_start_game(data):
             "is_imposter": (m_sid == imposter_sid),
             "turn_order": [players.get(s, "?") for s in turn_order],
             "category":   room["category"],
+            "points":     IMPOSTER_START_POINTS,
         }, to=m_sid)
 
     logger.info(f"imposter room {room_id} started: {len(members)} players, imposter is {players.get(imposter_sid)}")
@@ -949,19 +978,25 @@ def _imposter_resolve_vote(room_id):
         tally[accused_sid] = tally.get(accused_sid, 0) + 1
     top_count = max(tally.values())
     top_sids  = [s for s, c in tally.items() if c == top_count]
-    caught    = (len(top_sids) == 1 and top_sids[0] == room["imposter_sid"])
+    top_sid   = top_sids[0] if len(top_sids) == 1 else None
 
     # Server-decided outcome, unlike 1v1's self-reported one — safe to pay
-    # out directly. Caught: everyone but the imposter wins. Not caught:
-    # just the imposter does.
-    winners = [s for s in room["members"] if s != room["imposter_sid"]] if caught else [room["imposter_sid"]]
+    # out directly. See _imposter_decide_outcome for who wins in each case.
+    outcome, winners = _imposter_decide_outcome(room, top_sid)
+    caught = (outcome == "caught")
     for sid in winners:
         _award_points(device_ids.get(sid), WIN_POINTS)
+
+    original_sid  = room.get("original_imposter_sid") or room["imposter_sid"]
+    original_name = room.get("original_names", {}).get(original_sid) or players.get(original_sid, "?")
 
     room["round"] = 5
     _imposter_room_broadcast(room_id, "imposter_result", {
         "caught":    caught,
+        "outcome":   outcome,    # "caught" | "swap_win" | "escaped"
         "imposter":  players.get(room["imposter_sid"], "?"),
+        "swapped":   original_sid != room["imposter_sid"],
+        "original_imposter": original_name,
         "real_card": room["secret_card"],
         "votes":     {players.get(v, "?"): players.get(a, "?") for v, a in room["votes"].items()},
     })
@@ -982,11 +1017,207 @@ def _imposter_resolve_vote(room_id):
         real_card=room["secret_card"],
         imposter_card=room["imposter_card"],
         caught=caught,
-        winner=("innocents" if caught else "imposter"),
+        winner={"caught": "innocents", "swap_win": "original_imposter"}.get(outcome, "imposter"),
+        outcome=outcome,
+        original_imposter=original_name,
+        powers=room.get("power_log", []),
         votes={names.get(v, "?"): names.get(a, "?") for v, a in room["votes"].items()},
         transcript=room["transcript"],
         duration_sec=round(_time.time() - room["started_at"], 1) if room.get("started_at") else None,
     )
+
+
+# ── Imposter power-ups ───────────────────────────────────────────────────────
+# The server owns all of this (points, cards, who holds the title). Clients
+# only ask for a power and get told the result, so nobody can edit their own
+# points or card from the outside.
+
+def _imposter_blank_power_state():
+    return {
+        "original_imposter_sid": None,
+        "player_cards":    {},    # sid -> card name that player currently sees
+        "points":          {},    # sid -> remaining power points
+        "powers_used":     {},    # sid -> set of power keys already used
+        "pending_choices": {},    # sid -> the two cards offered by NEW SECRET
+        "power_log":       [],    # for game_history.txt / gameplay.log
+    }
+
+
+def _imposter_send_role_update(room, sid, message=""):
+    """Tell one player their current role / card / points. Used after any
+    power that changes something for them."""
+    socketio.emit("imposter_role_update", {
+        "is_imposter": sid == room["imposter_sid"],
+        "your_card":   room["player_cards"].get(sid, ""),
+        "points":      room["points"].get(sid, 0),
+        "powers_used": sorted(room["powers_used"].get(sid, set())),
+        "message":     message,
+    }, to=sid)
+
+
+def _imposter_power_denied(sid, reason):
+    socketio.emit("imposter_power_denied", {"reason": reason}, to=sid)
+
+
+def _imposter_power_check(sid, power):
+    """Shared gatekeeping for every power. Returns the room if `sid` may use
+    `power` right now, otherwise tells them why and returns None."""
+    room_id = player_room.get(sid)
+    room = imposter_rooms.get(room_id) if room_id else None
+    if not room or not room["started"] or room["round"] not in (1, 2, 3):
+        _imposter_power_denied(sid, "Powers only work while everyone is describing.")
+        return None
+    if sid != room["imposter_sid"]:
+        _imposter_power_denied(sid, "Only the Imposter can use powers.")
+        return None
+    if power in room["powers_used"].get(sid, set()):
+        _imposter_power_denied(sid, "You already used that power this game.")
+        return None
+    cost = IMPOSTER_POWER_COSTS[power]
+    if room["points"].get(sid, 0) < cost:
+        _imposter_power_denied(sid, f"Not enough points - that one costs {cost}.")
+        return None
+    return room
+
+
+def _imposter_spend(room, sid, power):
+    room["points"][sid] = room["points"].get(sid, 0) - IMPOSTER_POWER_COSTS[power]
+    room["powers_used"].setdefault(sid, set()).add(power)
+    room["pending_choices"].pop(sid, None)   # their card is about to change
+
+
+def _imposter_log_power(room, sid, power, detail):
+    room["power_log"].append({
+        "round":  room["round"],
+        "player": players.get(sid, "?"),
+        "power":  power,
+        "label":  IMPOSTER_POWER_LABELS[power],
+        "cost":   IMPOSTER_POWER_COSTS[power],
+        "detail": detail,
+    })
+
+
+def _imposter_decide_outcome(room, top_sid):
+    """Who won? `top_sid` is the single most-voted player, or None on a tie.
+
+    current  = whoever holds the Imposter title right now
+    original = whoever was dealt the Imposter card at the start
+    They're the same person unless someone used SWAP ROLE.
+
+      * current is voted out            -> "caught": everyone except current wins
+                                          (that includes the original imposter
+                                          after a swap — they're an innocent now)
+      * swapped, and ORIGINAL is voted  -> "swap_win": the original imposter wins
+      * anything else (wrong player/tie)-> "escaped": current imposter wins
+    Returns (outcome, [winner_sids]).
+    """
+    current  = room["imposter_sid"]
+    original = room.get("original_imposter_sid") or current
+    swapped  = original != current
+
+    if top_sid is not None and top_sid == current:
+        return "caught", [s for s in room["members"] if s != current]
+    if swapped and top_sid is not None and top_sid == original:
+        return "swap_win", [original]
+    return "escaped", [current]
+
+
+@socketio.on("imposter_power_swap")
+def on_imposter_power_swap(data):
+    """25 pts. A random innocent becomes the Imposter (title AND card move
+    with it), and the caller becomes an innocent holding the real card."""
+    sid = request.sid
+    room = _imposter_power_check(sid, "swap")
+    if not room:
+        return
+    others = [s for s in room["members"] if s != sid]
+    if not others:
+        _imposter_power_denied(sid, "Nobody to swap with.")
+        return
+    target = random.choice(others)
+
+    _imposter_spend(room, sid, "swap")
+    room["pending_choices"].pop(target, None)
+    cards = room["player_cards"]
+    cards[sid], cards[target] = cards[target], cards[sid]
+    room["imposter_sid"] = target
+
+    _imposter_log_power(room, sid, "swap", f"swapped roles with {players.get(target, '?')}")
+    _imposter_send_role_update(room, sid, "Swapped! You're INNOCENT now - someone else holds the Imposter title.")
+    _imposter_send_role_update(room, target, "You've been made the IMPOSTER! Your card changed.")
+
+
+@socketio.on("imposter_power_request_choices")
+def on_imposter_power_request_choices(data):
+    """10 pts (charged when they PICK, not when they look). Offers two cards:
+    the real one and a random decoy, shuffled so the Imposter can't tell
+    which is which. Neither is the card they're already holding."""
+    sid = request.sid
+    room = _imposter_power_check(sid, "choose")
+    if not room:
+        return
+    real    = room["secret_card"]
+    current = room["player_cards"].get(sid)
+    if current == real:
+        _imposter_power_denied(sid, "Your secret already matches everyone else's.")
+        return
+
+    pending = room["pending_choices"].get(sid)
+    if not pending:
+        # Stored the first time so cancelling and re-opening can't be used
+        # to re-roll the decoy (the card that shows up every time = the real one).
+        if _get_category_cards is None:
+            _imposter_power_denied(sid, "This server can't offer card choices right now.")
+            return
+        pool = [c["name"] for c in _get_category_cards(room["category"])
+                if c["name"] not in (real, current)]
+        if not pool:
+            _imposter_power_denied(sid, "No other cards available to offer.")
+            return
+        pending = [real, random.choice(pool)]
+        random.shuffle(pending)
+        room["pending_choices"][sid] = pending
+
+    socketio.emit("imposter_power_choices", {
+        "cards": pending, "cost": IMPOSTER_POWER_COSTS["choose"],
+    }, to=sid)
+
+
+@socketio.on("imposter_power_pick")
+def on_imposter_power_pick(data):
+    sid = request.sid
+    room = _imposter_power_check(sid, "choose")
+    if not room:
+        return
+    pending = list(room["pending_choices"].get(sid) or [])
+    card = str((data or {}).get("card", "")).strip()
+    if card not in pending:
+        _imposter_power_denied(sid, "Those choices are no longer available.")
+        return
+
+    _imposter_spend(room, sid, "choose")      # also clears the pending pair
+    room["player_cards"][sid] = card
+    note = "matches the real card" if card == room["secret_card"] else "decoy"
+    _imposter_log_power(room, sid, "choose", f"picked {card} ({note})")
+    _imposter_send_role_update(room, sid, f"Your secret is now {card}.")
+
+
+@socketio.on("imposter_power_match")
+def on_imposter_power_match(data):
+    """50 pts. Guaranteed: the Imposter's card becomes the real one."""
+    sid = request.sid
+    room = _imposter_power_check(sid, "match")
+    if not room:
+        return
+    real = room["secret_card"]
+    if room["player_cards"].get(sid) == real:
+        _imposter_power_denied(sid, "Your secret already matches everyone else's.")
+        return
+
+    _imposter_spend(room, sid, "match")
+    room["player_cards"][sid] = real
+    _imposter_log_power(room, sid, "match", f"card changed to the real card ({real})")
+    _imposter_send_role_update(room, sid, f"Your secret is now {real}.")
 
 
 @socketio.on("imposter_play_again")
@@ -1003,6 +1234,7 @@ def on_imposter_play_again(data):
         "imposter_card": None, "round": 0, "turn_order": [], "turn_idx": 0,
         "votes": {}, "transcript": [],
     })
+    room.update(_imposter_blank_power_state())
     _imposter_room_broadcast(room_id, "imposter_room_state", _imposter_room_public_state(room_id))
 
 
