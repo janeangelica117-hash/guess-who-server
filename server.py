@@ -3,11 +3,17 @@ import random
 import uuid
 import sqlite3
 import time as _time
+from urllib.parse import quote
 from flask import Flask, request, send_file, abort
 from flask_socketio import SocketIO, emit
 
-from game_logging import setup_logging, log_event, GAME_HISTORY_PATH
+from game_logging import setup_logging, log_event, GAME_HISTORY_PATH, GAMEPLAY_JSON_PATH
 import logging
+
+try:
+    import game_history_view     # the picture version of the game history page
+except Exception:                # file wasn't deployed — plain-text history still works
+    game_history_view = None
 
 try:
     # Pure-data module (no pygame) — the server only needs it to pick the
@@ -41,6 +47,43 @@ def admin_game_history():
     # add ?download=1 to save it as a file instead.
     as_attachment = request.args.get("download") == "1"
     return send_file(GAME_HISTORY_PATH, mimetype="text/plain", as_attachment=as_attachment)
+
+
+@app.route("/admin/game-history/view")
+def admin_game_history_view():
+    """Same history, but as a web page with the actual card pictures.
+    ?limit=N shows the last N games (default 100, max 500)."""
+    if not ADMIN_KEY or request.args.get("key") != ADMIN_KEY:
+        abort(403)
+    if game_history_view is None:
+        return "game_history_view.py isn't deployed on this server.", 503, {"Content-Type": "text/plain"}
+    try:
+        limit = max(1, min(500, int(request.args.get("limit", 100))))
+    except ValueError:
+        limit = 100
+    events = game_history_view.read_events(GAMEPLAY_JSON_PATH, limit)
+    page = game_history_view.render_page(
+        events,
+        game_history_view.server_image_src(ADMIN_KEY),
+        plain_text_url=f"/admin/game-history?key={quote(ADMIN_KEY, safe='')}",
+        limit_note=f" (last {limit} at most)",
+    )
+    return page, 200, {"Content-Type": "text/html; charset=utf-8", "Referrer-Policy": "no-referrer"}
+
+
+@app.route("/admin/card-image/<category>/<path:card_name>")
+def admin_card_image(category, card_name):
+    """One card's picture, looked up by category + card NAME from the game's
+    own card lists (never by a file path from the URL), so it can only ever
+    serve card art."""
+    if not ADMIN_KEY or request.args.get("key") != ADMIN_KEY:
+        abort(403)
+    path = game_history_view.card_image_path(category, card_name) if game_history_view else None
+    if not path:
+        abort(404)
+    resp = send_file(path)
+    resp.headers["Cache-Control"] = "private, max-age=86400"
+    return resp
 
 
 # { socket_id: username }
